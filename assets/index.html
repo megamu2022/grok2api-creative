@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grok2API Creative</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <div class="brand">Grok2API Creative</div>
+        <button id="btn-settings" class="icon-btn" title="设置">⚙</button>
+      </div>
+      <div class="new-row">
+        <button data-new="chat">+ Chat</button>
+        <button data-new="image">+ Image</button>
+        <button data-new="image_edit">+ Edit</button>
+        <button data-new="video">+ Video</button>
+      </div>
+      <input id="history-filter" placeholder="搜索历史…" />
+      <div id="history-list" class="history-list"></div>
+    </aside>
+    <main class="main">
+      <div id="setup-banner" class="banner hidden">请先在设置中填写 grok2api 的 /v1 地址与 API Key</div>
+      <header class="topbar">
+        <div id="item-title" class="item-title">选择或新建会话</div>
+        <div id="toolbar" class="toolbar"></div>
+      </header>
+      <section id="content" class="content empty-state">从左侧新建 Chat / Image / Edit / Video</section>
+      <footer id="composer" class="composer hidden"></footer>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog">
+    <form method="dialog" id="settings-form" class="settings">
+      <h2>连接设置</h2>
+      <label>Base URL（含或不含 /v1）
+        <input name="base_url" id="cfg-base" placeholder="http://127.0.0.1:8000/v1" />
+      </label>
+      <label>API Key
+        <input name="api_key" id="cfg-key" type="password" placeholder="g2a_..." autocomplete="off" />
+      </label>
+      <p class="muted" id="cfg-masked"></p>
+      <label>默认 Chat 模型<input id="cfg-chat-model" /></label>
+      <label>默认 Image 模型<input id="cfg-image-model" /></label>
+      <label>默认 Image Edit 模型<input id="cfg-edit-model" placeholder="grok-imagine-image-edit" /></label>
+      <label>默认 Video 模型<input id="cfg-video-model" /></label>
+      <div class="row">
+        <button type="button" id="btn-test">测试连接</button>
+        <button type="submit" value="save" id="btn-save-cfg">保存</button>
+        <button type="submit" value="cancel">取消</button>
+      </div>
+      <pre id="cfg-status" class="status"></pre>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>
