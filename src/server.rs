@@ -278,7 +278,7 @@ async fn chat_stream(
     Json(body): Json<ChatStreamBody>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let client = client_from_state(&state).await?;
-    let (req, assistant_id) = {
+    let (req, assistant_id, user_id) = {
         let mut store = state.history.write().await;
         let item = store
             .get_mut(&body.history_id)
@@ -287,8 +287,9 @@ async fn chat_stream(
             ItemPayload::Chat(chat) => chat,
             _ => return Err(ApiError::bad("not a chat item")),
         };
+        let user_id = new_message_id();
         chat.messages.push(ChatMessage {
-            id: new_message_id(),
+            id: user_id.clone(),
             role: Role::User,
             content: body.content.clone(),
             reasoning: None,
@@ -332,51 +333,72 @@ async fn chat_stream(
             x_search: chat.x_search,
         };
         store.save().map_err(|e| ApiError::internal(e.to_string()))?;
-        (req, assistant_id)
+        (req, assistant_id, user_id)
     };
 
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel::<crate::client::ChatStreamEvent>(64);
     let state2 = state.clone();
     let history_id = body.history_id.clone();
     let assistant_id2 = assistant_id.clone();
+    let user_id2 = user_id.clone();
 
     tokio::spawn(async move {
         let result = stream_chat(&client, req, tx.clone()).await;
         match result {
             Ok(snap) => {
-                let mut store = state2.history.write().await;
-                if let Some(item) = store.get_mut(&history_id) {
-                    if let ItemPayload::Chat(chat) = &mut item.payload {
-                        if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == assistant_id2)
-                        {
-                            msg.content = snap.text;
-                            msg.reasoning = Some(snap.reasoning);
-                            msg.tools = snap.tools;
+                let messages = {
+                    let mut store = state2.history.write().await;
+                    if let Some(item) = store.get_mut(&history_id) {
+                        if let ItemPayload::Chat(chat) = &mut item.payload {
+                            if let Some(msg) =
+                                chat.messages.iter_mut().find(|m| m.id == assistant_id2)
+                            {
+                                msg.content = snap.text.clone();
+                                msg.reasoning = Some(snap.reasoning.clone());
+                                msg.tools = snap.tools.clone();
+                            }
+                            let msgs = chat.messages.clone();
+                            item.touch();
+                            let _ = store.save();
+                            Some(msgs)
+                        } else {
+                            None
                         }
-                        item.touch();
+                    } else {
+                        None
                     }
-                }
-                let _ = store.save();
+                };
+                let _ = tx
+                    .send(crate::client::ChatStreamEvent::Done {
+                        snapshot: snap,
+                        messages,
+                        assistant_id: Some(assistant_id2),
+                        user_id: Some(user_id2),
+                    })
+                    .await;
             }
             Err(e) => {
+                {
+                    let mut store = state2.history.write().await;
+                    if let Some(item) = store.get_mut(&history_id) {
+                        if let ItemPayload::Chat(chat) = &mut item.payload {
+                            if let Some(msg) =
+                                chat.messages.iter_mut().find(|m| m.id == assistant_id2)
+                            {
+                                if msg.content.is_empty() {
+                                    msg.content = format!("Error: {e}");
+                                }
+                            }
+                            item.touch();
+                        }
+                    }
+                    let _ = store.save();
+                }
                 let _ = tx
                     .send(crate::client::ChatStreamEvent::Error {
                         message: e.to_string(),
                     })
                     .await;
-                let mut store = state2.history.write().await;
-                if let Some(item) = store.get_mut(&history_id) {
-                    if let ItemPayload::Chat(chat) = &mut item.payload {
-                        if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == assistant_id2)
-                        {
-                            if msg.content.is_empty() {
-                                msg.content = format!("Error: {e}");
-                            }
-                        }
-                        item.touch();
-                    }
-                }
-                let _ = store.save();
             }
         }
     });
@@ -533,28 +555,62 @@ async fn retry_message(
         (req, assistant_id)
     };
 
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel::<crate::client::ChatStreamEvent>(64);
     let state2 = state.clone();
     let history_id = id.clone();
     let assistant_id2 = assistant_id.clone();
+    let user_id2 = body.message_id.clone();
     tokio::spawn(async move {
         match stream_chat(&client, req, tx.clone()).await {
             Ok(snap) => {
-                let mut store = state2.history.write().await;
-                if let Some(item) = store.get_mut(&history_id) {
-                    if let ItemPayload::Chat(chat) = &mut item.payload {
-                        if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == assistant_id2)
-                        {
-                            msg.content = snap.text;
-                            msg.reasoning = Some(snap.reasoning);
-                            msg.tools = snap.tools;
+                let messages = {
+                    let mut store = state2.history.write().await;
+                    if let Some(item) = store.get_mut(&history_id) {
+                        if let ItemPayload::Chat(chat) = &mut item.payload {
+                            if let Some(msg) =
+                                chat.messages.iter_mut().find(|m| m.id == assistant_id2)
+                            {
+                                msg.content = snap.text.clone();
+                                msg.reasoning = Some(snap.reasoning.clone());
+                                msg.tools = snap.tools.clone();
+                            }
+                            let msgs = chat.messages.clone();
+                            item.touch();
+                            let _ = store.save();
+                            Some(msgs)
+                        } else {
+                            None
                         }
-                        item.touch();
+                    } else {
+                        None
                     }
-                }
-                let _ = store.save();
+                };
+                let _ = tx
+                    .send(crate::client::ChatStreamEvent::Done {
+                        snapshot: snap,
+                        messages,
+                        assistant_id: Some(assistant_id2),
+                        user_id: Some(user_id2),
+                    })
+                    .await;
             }
             Err(e) => {
+                {
+                    let mut store = state2.history.write().await;
+                    if let Some(item) = store.get_mut(&history_id) {
+                        if let ItemPayload::Chat(chat) = &mut item.payload {
+                            if let Some(msg) =
+                                chat.messages.iter_mut().find(|m| m.id == assistant_id2)
+                            {
+                                if msg.content.is_empty() {
+                                    msg.content = format!("Error: {e}");
+                                }
+                            }
+                            item.touch();
+                        }
+                    }
+                    let _ = store.save();
+                }
                 let _ = tx
                     .send(crate::client::ChatStreamEvent::Error {
                         message: e.to_string(),

@@ -7,13 +7,82 @@ const state = {
   streaming: false,
 };
 
-const $ = (sel) => document.querySelector(sel);
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
   if (text != null) n.textContent = text;
   return n;
 };
+
+function setupMarkdown() {
+  if (!window.marked) return;
+  marked.setOptions({
+    gfm: true,
+    breaks: true,
+    highlight(code, lang) {
+      if (window.hljs) {
+        try {
+          if (lang && hljs.getLanguage(lang)) {
+            return hljs.highlight(code, { language: lang }).value;
+          }
+          return hljs.highlightAuto(code).value;
+        } catch {
+          return escapeHtml(code);
+        }
+      }
+      return escapeHtml(code);
+    },
+  });
+}
+
+function renderMarkdown(text) {
+  const raw = text || "";
+  if (!window.marked || !window.DOMPurify) {
+    return escapeHtml(raw).replace(/\n/g, "<br>");
+  }
+  const html = marked.parse(raw);
+  return DOMPurify.sanitize(html, {
+    ADD_ATTR: ["target", "rel", "class"],
+  });
+}
+
+function applyKatex(container) {
+  if (!window.renderMathInElement || !container) return;
+  try {
+    renderMathInElement(container, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "\\[", right: "\\]", display: true },
+        { left: "$", right: "$", display: false },
+        { left: "\\(", right: "\\)", display: false },
+      ],
+      throwOnError: false,
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+function setMarkdownBody(node, text, { plain = false } = {}) {
+  if (!node) return;
+  if (plain) {
+    node.classList.add("plain");
+    node.classList.remove("md");
+    node.textContent = text || "";
+    return;
+  }
+  node.classList.remove("plain");
+  node.classList.add("md");
+  node.innerHTML = renderMarkdown(text || "");
+  if (window.hljs) {
+    node.querySelectorAll("pre code").forEach((block) => {
+      try { hljs.highlightElement(block); } catch { /* ignore */ }
+    });
+  }
+  applyKatex(node);
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -44,29 +113,38 @@ function kindLabel(kind) {
   return ({ chat: "chat", image: "image", image_edit: "edit", video: "video" })[kind] || kind;
 }
 
-function activeItem() {
-  return state.items.find((x) => x.id === state.activeId) || null;
-}
-
-function chatPayload(item) {
-  return item?.payload?.payload_type === "chat" ? item.payload : item?.payload;
-}
-function isChat(item) { return item?.kind === "chat"; }
-function isImage(item) { return item?.kind === "image"; }
-function isEdit(item) { return item?.kind === "image_edit"; }
-function isVideo(item) { return item?.kind === "video"; }
-
 function payloadOf(item) {
   if (!item) return null;
   const p = item.payload;
   if (!p) return null;
-  // serde: { payload_type, data }
   if (p.payload_type && p.data) return { type: p.payload_type, data: p.data };
   if (p.messages) return { type: "chat", data: p };
   if (item.kind === "image") return { type: "image", data: p };
   if (item.kind === "image_edit") return { type: "image_edit", data: p };
   if (item.kind === "video") return { type: "video", data: p };
   return { type: item.kind, data: p };
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function escapeAttr(s) { return escapeHtml(s); }
+
+function normalizeRole(role) {
+  if (!role) return "assistant";
+  const r = String(role).toLowerCase();
+  if (r === "user" || r === "assistant" || r === "system") return r;
+  return r;
+}
+
+function toolName(t) {
+  return t?.name || t?.type_name || t?.type || "tool";
+}
+
+function toolStatus(t) {
+  return t?.status || "completed";
 }
 
 async function refreshConfig() {
@@ -76,7 +154,9 @@ async function refreshConfig() {
   else banner.classList.add("hidden");
   $("#cfg-base").value = state.config.base_url || "";
   $("#cfg-key").value = "";
-  $("#cfg-masked").textContent = state.config.api_key_set ? `当前 Key: ${state.config.api_key_masked}` : "尚未设置 Key";
+  $("#cfg-masked").textContent = state.config.api_key_set
+    ? `当前 Key: ${state.config.api_key_masked}`
+    : "尚未设置 Key";
   $("#cfg-chat-model").value = state.config.default_chat_model || "";
   $("#cfg-image-model").value = state.config.default_image_model || "";
   $("#cfg-edit-model").value = state.config.default_image_edit_model || "";
@@ -93,10 +173,11 @@ async function refreshModels() {
   }
 }
 
-async function refreshHistory() {
+async function refreshHistory({ rerender = true } = {}) {
   const data = await api("/api/history");
   state.items = data.items || [];
   renderHistory();
+  if (!rerender) return;
   if (state.activeId) {
     const still = state.items.find((x) => x.id === state.activeId);
     if (still) renderMain(still);
@@ -107,11 +188,22 @@ async function refreshHistory() {
   }
 }
 
+function updateLocalItemMessages(historyId, messages) {
+  const item = state.items.find((x) => x.id === historyId);
+  if (!item) return;
+  const p = payloadOf(item);
+  if (p?.type !== "chat") return;
+  p.data.messages = messages;
+  item.payload = { payload_type: "chat", data: p.data };
+}
+
 function renderHistory() {
   const list = $("#history-list");
   list.innerHTML = "";
   const q = state.filter.trim().toLowerCase();
-  const items = state.items.filter((it) => !q || (it.title || "").toLowerCase().includes(q) || it.kind.includes(q));
+  const items = state.items.filter(
+    (it) => !q || (it.title || "").toLowerCase().includes(q) || it.kind.includes(q),
+  );
   for (const it of items) {
     const row = el("div", `history-item${it.id === state.activeId ? " active" : ""}`);
     row.innerHTML = `
@@ -144,13 +236,10 @@ function renderHistory() {
 function modelOptions(filterFn) {
   const models = state.models.filter(filterFn);
   if (!models.length) return `<option value="">（手填或先拉取模型）</option>`;
-  return models.map((m) => `<option value="${escapeAttr(m.id)}">${escapeHtml(m.id)}</option>`).join("");
+  return models
+    .map((m) => `<option value="${escapeAttr(m.id)}">${escapeHtml(m.id)}</option>`)
+    .join("");
 }
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-function escapeAttr(s) { return escapeHtml(s); }
 
 function renderMain(item) {
   const title = $("#item-title");
@@ -177,9 +266,7 @@ function renderMain(item) {
   else if (p?.type === "image") renderImage(item, p.data);
   else if (p?.type === "image_edit") renderImageEdit(item, p.data);
   else if (p?.type === "video") renderVideo(item, p.data);
-  else {
-    content.textContent = "未知类型";
-  }
+  else content.textContent = "未知类型";
 }
 
 function renderChat(item, chat) {
@@ -192,11 +279,16 @@ function renderChat(item, chat) {
     <label><input type="checkbox" id="chat-x" ${chat.x_search ? "checked" : ""}/> X</label>
     <label>思考
       <select id="chat-reason">
-        ${["auto","none","low","medium","high","xhigh"].map((v) =>
-          `<option value="${v}" ${chat.reasoning_effort === v ? "selected" : ""}>${v}</option>`).join("")}
+        ${["auto", "none", "low", "medium", "high", "xhigh"]
+          .map(
+            (v) =>
+              `<option value="${v}" ${chat.reasoning_effort === v ? "selected" : ""}>${v}</option>`,
+          )
+          .join("")}
       </select>
     </label>
     <button id="chat-save-settings">应用设置</button>`;
+
   const modelSel = $("#chat-model");
   if (chat.model) {
     if (![...modelSel.options].some((o) => o.value === chat.model)) {
@@ -225,7 +317,7 @@ function renderChat(item, chat) {
   const composer = $("#composer");
   composer.classList.remove("hidden");
   composer.innerHTML = `
-    <textarea id="chat-input" placeholder="输入消息… Enter 发送，Shift+Enter 换行"></textarea>
+    <textarea id="chat-input" placeholder="输入消息… Enter 发送，Shift+Enter 换行" ${state.streaming ? "disabled" : ""}></textarea>
     <div class="row">
       <button id="chat-send" ${state.streaming ? "disabled" : ""}>发送</button>
       <span class="status" id="chat-status"></span>
@@ -240,69 +332,153 @@ function renderChat(item, chat) {
   $("#chat-send").onclick = () => sendChat(item);
 }
 
-function renderMessage(item, msg) {
-  const node = el("div", `msg ${msg.role}`);
-  node.dataset.id = msg.id;
-  const role = el("div", "role", msg.role);
-  const body = el("div", "body", msg.content || "");
-  node.appendChild(role);
-  node.appendChild(body);
-  if (msg.reasoning) {
-    const r = el("div", "reasoning");
-    r.textContent = msg.reasoning;
-    node.appendChild(r);
-  }
-  if (msg.tools?.length) {
-    const tools = el("div", "tools");
-    for (const t of msg.tools) {
-      const row = el("div", "tool");
-      row.textContent = `${t.status} · ${t.name || t.type} ${t.detail ? "· " + t.detail : ""}`;
-      tools.appendChild(row);
+function renderToolCards(tools) {
+  const wrap = el("div", "tools");
+  for (const t of tools || []) {
+    const card = el("div", "tool-card");
+    const head = el("div", "tool-head");
+    const badge = el("span", `badge ${toolStatus(t)}`, toolStatus(t));
+    const name = el("span", "tool-name", toolName(t));
+    head.appendChild(badge);
+    head.appendChild(name);
+    card.appendChild(head);
+    if (t.detail) {
+      card.appendChild(el("div", "tool-detail", t.detail));
     }
-    node.appendChild(tools);
+    wrap.appendChild(card);
   }
-  const actions = el("div", "msg-actions");
-  if (msg.role === "user" || msg.role === "assistant") {
+  return wrap;
+}
+
+function renderMessage(item, msg, { live = false } = {}) {
+  const role = normalizeRole(msg.role);
+  const node = el("div", `msg ${role}${live ? " streaming" : ""}`);
+  if (msg.id) node.dataset.id = msg.id;
+  if (live) node.dataset.live = "1";
+
+  const roleRow = el("div", "role-row");
+  roleRow.appendChild(el("div", "role", role === "user" ? "You" : role));
+  if (live) roleRow.appendChild(el("div", "stream-dot"));
+  node.appendChild(roleRow);
+
+  if (msg.reasoning) {
+    const details = document.createElement("details");
+    details.className = "reasoning";
+    details.open = live;
+    const summary = document.createElement("summary");
+    summary.textContent = "Thinking";
+    details.appendChild(summary);
+    const body = el("div", null, msg.reasoning);
+    details.appendChild(body);
+    node.appendChild(details);
+  }
+
+  if (msg.tools?.length) {
+    node.appendChild(renderToolCards(msg.tools));
+  }
+
+  const body = el("div", "body");
+  if (role === "assistant") setMarkdownBody(body, msg.content || "");
+  else setMarkdownBody(body, msg.content || "", { plain: true });
+  node.appendChild(body);
+
+  // inline edit area
+  const editBox = el("div", "edit-box");
+  const ta = document.createElement("textarea");
+  ta.value = msg.content || "";
+  editBox.appendChild(ta);
+  const editActions = el("div", "edit-actions");
+  const saveBtn = el("button", null, "保存");
+  const saveRetryBtn = el("button", null, "保存并重试");
+  const cancelBtn = el("button", null, "取消");
+  editActions.appendChild(saveBtn);
+  if (role === "user") editActions.appendChild(saveRetryBtn);
+  editActions.appendChild(cancelBtn);
+  editBox.appendChild(editActions);
+  node.appendChild(editBox);
+
+  if (!live && (role === "user" || role === "assistant") && msg.id) {
+    const actions = el("div", "msg-actions");
     const editBtn = el("button", null, "编辑");
-    editBtn.onclick = async () => {
-      const next = prompt("编辑消息内容", msg.content || "");
-      if (next == null) return;
-      const resend = msg.role === "user" ? confirm("是否用新内容重新生成回复？") : false;
+    editBtn.onclick = () => {
+      node.classList.add("editing");
+      ta.value = msg.content || "";
+      ta.focus();
+    };
+    cancelBtn.onclick = () => node.classList.remove("editing");
+    saveBtn.onclick = async () => {
+      const next = ta.value;
       await api(`/api/chat/${item.id}/edit-message`, {
         method: "POST",
-        body: JSON.stringify({ message_id: msg.id, content: next, resend }),
+        body: JSON.stringify({ message_id: msg.id, content: next, resend: false }),
       });
       await refreshHistory();
-      if (resend && msg.role === "user") {
-        await streamRetry(item.id, msg.id);
-      }
+    };
+    saveRetryBtn.onclick = async () => {
+      const next = ta.value;
+      await api(`/api/chat/${item.id}/edit-message`, {
+        method: "POST",
+        body: JSON.stringify({ message_id: msg.id, content: next, resend: true }),
+      });
+      await refreshHistory({ rerender: true });
+      await streamRetry(item.id, msg.id);
     };
     actions.appendChild(editBtn);
+
+    const delBtn = el("button", null, "删除");
+    delBtn.onclick = async () => {
+      if (!confirm("删除该消息？")) return;
+      await api(`/api/chat/${item.id}/delete-message`, {
+        method: "POST",
+        body: JSON.stringify({ message_id: msg.id }),
+      });
+      await refreshHistory();
+    };
+    actions.appendChild(delBtn);
+
+    if (role === "user") {
+      const retryBtn = el("button", null, "重试");
+      retryBtn.onclick = () => streamRetry(item.id, msg.id);
+      actions.appendChild(retryBtn);
+    }
+    node.appendChild(actions);
   }
-  const delBtn = el("button", null, "删除");
-  delBtn.onclick = async () => {
-    if (!confirm("删除该消息？")) return;
-    await api(`/api/chat/${item.id}/delete-message`, {
-      method: "POST",
-      body: JSON.stringify({ message_id: msg.id }),
-    });
-    await refreshHistory();
-  };
-  actions.appendChild(delBtn);
-  if (msg.role === "user") {
-    const retryBtn = el("button", null, "重试");
-    retryBtn.onclick = () => streamRetry(item.id, msg.id);
-    actions.appendChild(retryBtn);
-  }
-  node.appendChild(actions);
+
   return node;
 }
 
-async function sendChat(item) {
-  if (state.streaming) return;
-  const text = $("#chat-input")?.value?.trim();
-  if (!text) return;
-  // save settings first
+function updateLiveAssistant(node, snap) {
+  if (!node) return;
+  let reasoning = node.querySelector("details.reasoning");
+  if (snap.reasoning) {
+    if (!reasoning) {
+      reasoning = document.createElement("details");
+      reasoning.className = "reasoning";
+      reasoning.open = true;
+      reasoning.innerHTML = `<summary>Thinking</summary><div></div>`;
+      const roleRow = node.querySelector(".role-row");
+      roleRow.after(reasoning);
+    }
+    reasoning.querySelector("div").textContent = snap.reasoning;
+  }
+
+  let tools = node.querySelector(".tools");
+  if (snap.tools?.length) {
+    const next = renderToolCards(snap.tools);
+    if (tools) tools.replaceWith(next);
+    else {
+      const body = node.querySelector(".body");
+      body.before(next);
+    }
+  }
+
+  const body = node.querySelector(".body");
+  setMarkdownBody(body, snap.text || "");
+  const box = node.parentElement;
+  if (box) box.scrollTop = box.scrollHeight;
+}
+
+async function persistChatSettings(item) {
   const chat = payloadOf(item).data;
   chat.model = $("#chat-model")?.value || chat.model;
   chat.web_search = $("#chat-web")?.checked ?? chat.web_search;
@@ -310,17 +486,65 @@ async function sendChat(item) {
   chat.reasoning_effort = $("#chat-reason")?.value || chat.reasoning_effort;
   item.payload = { payload_type: "chat", data: chat };
   await api(`/api/history/${item.id}`, { method: "PUT", body: JSON.stringify(item) });
+  return chat;
+}
+
+async function sendChat(item) {
+  if (state.streaming) return;
+  const text = $("#chat-input")?.value?.trim();
+  if (!text) return;
+
+  await persistChatSettings(item);
+
+  const box = $("#content .messages");
+  // optimistic user bubble
+  const userNode = renderMessage(item, {
+    id: `tmp-user-${Date.now()}`,
+    role: "user",
+    content: text,
+  });
+  // strip actions on temp optimistic node until final history arrives
+  userNode.querySelector(".msg-actions")?.remove();
+  userNode.querySelector(".edit-box")?.remove();
+  box?.appendChild(userNode);
+
+  const assistantNode = renderMessage(
+    item,
+    { id: `tmp-assistant-${Date.now()}`, role: "assistant", content: "", reasoning: "", tools: [] },
+    { live: true },
+  );
+  assistantNode.querySelector(".msg-actions")?.remove();
+  assistantNode.querySelector(".edit-box")?.remove();
+  box?.appendChild(assistantNode);
+  if (box) box.scrollTop = box.scrollHeight;
 
   state.streaming = true;
   $("#chat-status").textContent = "生成中…";
+  $("#chat-status").classList.remove("error");
   $("#chat-input").value = "";
+  $("#chat-input").disabled = true;
+  $("#chat-send").disabled = true;
+
   try {
-    await consumeSse("/api/chat/stream", { history_id: item.id, content: text }, item.id);
+    await consumeSse(
+      "/api/chat/stream",
+      { history_id: item.id, content: text },
+      item.id,
+      { liveNode: assistantNode },
+    );
+    $("#chat-status").textContent = "";
   } catch (e) {
     $("#chat-status").textContent = e.message;
     $("#chat-status").classList.add("error");
+    const body = assistantNode.querySelector(".body");
+    if (body && !body.textContent.trim()) {
+      setMarkdownBody(body, `Error: ${e.message}`, { plain: true });
+    }
   } finally {
     state.streaming = false;
+    $("#chat-input").disabled = false;
+    $("#chat-send").disabled = false;
+    // final authoritative render after history is saved on server
     await refreshHistory();
   }
 }
@@ -328,8 +552,36 @@ async function sendChat(item) {
 async function streamRetry(historyId, messageId) {
   if (state.streaming) return;
   state.streaming = true;
+  const item = state.items.find((x) => x.id === historyId);
+  const box = $("#content .messages");
+  // remove trailing assistant after this user if present in DOM
+  if (box) {
+    const userEl = box.querySelector(`.msg.user[data-id="${CSS.escape(messageId)}"]`);
+    if (userEl) {
+      let n = userEl.nextElementSibling;
+      while (n && n.classList.contains("assistant")) {
+        const next = n.nextElementSibling;
+        n.remove();
+        n = next;
+      }
+    }
+  }
+  const assistantNode = renderMessage(
+    item || { id: historyId },
+    { role: "assistant", content: "", tools: [] },
+    { live: true },
+  );
+  assistantNode.querySelector(".msg-actions")?.remove();
+  assistantNode.querySelector(".edit-box")?.remove();
+  box?.appendChild(assistantNode);
+
   try {
-    await consumeSse(`/api/chat/${historyId}/retry`, { message_id: messageId }, historyId);
+    await consumeSse(
+      `/api/chat/${historyId}/retry`,
+      { message_id: messageId },
+      historyId,
+      { liveNode: assistantNode },
+    );
   } catch (e) {
     alert(e.message);
   } finally {
@@ -338,7 +590,7 @@ async function streamRetry(historyId, messageId) {
   }
 }
 
-async function consumeSse(url, body, historyId) {
+async function consumeSse(url, body, historyId, { liveNode } = {}) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
@@ -352,18 +604,13 @@ async function consumeSse(url, body, historyId) {
   const decoder = new TextDecoder();
   let buf = "";
   let live = { text: "", reasoning: "", tools: [] };
+  let lastPaint = 0;
 
-  // ensure UI shows streaming assistant bubble
-  const ensureLive = () => {
-    const content = $("#content .messages");
-    if (!content) return null;
-    let node = content.querySelector(".msg.assistant.live");
-    if (!node) {
-      node = el("div", "msg assistant live");
-      node.innerHTML = `<div class="role">assistant</div><div class="body"></div><div class="reasoning hidden"></div><div class="tools"></div>`;
-      content.appendChild(node);
-    }
-    return node;
+  const paint = (force = false) => {
+    const now = performance.now();
+    if (!force && now - lastPaint < 50) return;
+    lastPaint = now;
+    updateLiveAssistant(liveNode, live);
   };
 
   while (true) {
@@ -374,34 +621,43 @@ async function consumeSse(url, body, historyId) {
     while ((idx = buf.indexOf("\n\n")) >= 0) {
       const block = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
-      const dataLine = block.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart()).join("\n");
+      const dataLine = block
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trimStart())
+        .join("\n");
       if (!dataLine) continue;
       let ev;
       try { ev = JSON.parse(dataLine); } catch { continue; }
-      if (ev.type === "delta" || ev.type === "done") {
+      if (ev.type === "delta") {
         live = ev.snapshot || live;
-        const node = ensureLive();
-        if (node) {
-          node.querySelector(".body").textContent = live.text || "";
-          const r = node.querySelector(".reasoning");
-          if (live.reasoning) {
-            r.classList.remove("hidden");
-            r.textContent = live.reasoning;
-          }
-          const tools = node.querySelector(".tools");
-          tools.innerHTML = "";
-          for (const t of live.tools || []) {
-            tools.appendChild(el("div", "tool", `${t.status} · ${t.name || t.type_name || t.type} ${t.detail || ""}`));
-          }
-          node.parentElement.scrollTop = node.parentElement.scrollHeight;
+        paint(false);
+      } else if (ev.type === "done") {
+        live = ev.snapshot || live;
+        paint(true);
+        if (liveNode) {
+          liveNode.classList.remove("streaming");
+          liveNode.querySelector(".stream-dot")?.remove();
+          delete liveNode.dataset.live;
+          if (ev.assistant_id) liveNode.dataset.id = ev.assistant_id;
         }
-        if (ev.type === "done") return;
+        if (ev.user_id) {
+          const box = liveNode?.parentElement;
+          const tmpUser = box?.querySelector(".msg.user[data-id^='tmp-user-']");
+          if (tmpUser) tmpUser.dataset.id = ev.user_id;
+        }
+        if (Array.isArray(ev.messages)) {
+          updateLocalItemMessages(historyId, ev.messages);
+        }
+        return live;
       } else if (ev.type === "error") {
         throw new Error(ev.message || "stream error");
       }
     }
     if (done) break;
   }
+  paint(true);
+  return live;
 }
 
 function renderImage(item, data) {
@@ -410,7 +666,9 @@ function renderImage(item, data) {
     <label>模型<select id="img-model">${modelOptions((m) => /image/i.test(m.capability + m.id) && !/edit/i.test(m.id))}</select></label>`;
   const modelSel = $("#img-model");
   if (data.model) {
-    if (![...modelSel.options].some((o) => o.value === data.model)) modelSel.add(new Option(data.model, data.model, true, true));
+    if (![...modelSel.options].some((o) => o.value === data.model)) {
+      modelSel.add(new Option(data.model, data.model, true, true));
+    }
     modelSel.value = data.model;
   }
 
@@ -420,8 +678,8 @@ function renderImage(item, data) {
     <label>Prompt<textarea id="img-prompt" rows="4">${escapeHtml(data.prompt || "")}</textarea></label>
     <div class="row">
       <label>数量<input id="img-n" type="number" min="1" max="4" value="${data.count || 1}" /></label>
-      <label>比例<select id="img-ar">${["1:1","16:9","9:16","4:3","3:4","3:2","2:3"].map((v)=>`<option ${data.aspect_ratio===v?"selected":""}>${v}</option>`).join("")}</select></label>
-      <label>分辨率<select id="img-res">${["1k","2k"].map((v)=>`<option ${data.resolution===v?"selected":""}>${v}</option>`).join("")}</select></label>
+      <label>比例<select id="img-ar">${["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"].map((v) => `<option ${data.aspect_ratio === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+      <label>分辨率<select id="img-res">${["1k", "2k"].map((v) => `<option ${data.resolution === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>
       <button id="img-go">生成</button>
     </div>
     <div id="img-status" class="status"></div>
@@ -458,7 +716,9 @@ function renderImageEdit(item, data) {
     <label>模型<select id="edit-model">${modelOptions((m) => /edit|image/i.test(m.capability + m.id))}</select></label>`;
   const modelSel = $("#edit-model");
   const preferred = data.model || "grok-imagine-image-edit";
-  if (![...modelSel.options].some((o) => o.value === preferred)) modelSel.add(new Option(preferred, preferred, true, true));
+  if (![...modelSel.options].some((o) => o.value === preferred)) {
+    modelSel.add(new Option(preferred, preferred, true, true));
+  }
   modelSel.value = preferred;
 
   const content = $("#content");
@@ -469,8 +729,8 @@ function renderImageEdit(item, data) {
     <label>编辑说明<textarea id="edit-prompt" rows="3">${escapeHtml(data.prompt || "")}</textarea></label>
     <div class="row">
       <label>数量<input id="edit-n" type="number" min="1" max="4" value="${data.count || 1}" /></label>
-      <label>比例<select id="edit-ar">${["1:1","16:9","9:16","4:3","3:4","3:2","2:3"].map((v)=>`<option ${data.aspect_ratio===v?"selected":""}>${v}</option>`).join("")}</select></label>
-      <label>分辨率<select id="edit-res">${["1k","2k"].map((v)=>`<option ${data.resolution===v?"selected":""}>${v}</option>`).join("")}</select></label>
+      <label>比例<select id="edit-ar">${["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"].map((v) => `<option ${data.aspect_ratio === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+      <label>分辨率<select id="edit-res">${["1k", "2k"].map((v) => `<option ${data.resolution === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>
       <button id="edit-go">编辑生成</button>
     </div>
     <div id="edit-status" class="status"></div>
@@ -482,7 +742,10 @@ function renderImageEdit(item, data) {
     const file = e.target.files?.[0];
     if (!file) return;
     const b64 = await fileToDataUrl(file);
-    const up = await api("/api/media/upload", { method: "POST", body: JSON.stringify({ data: b64, filename: file.name }) });
+    const up = await api("/api/media/upload", {
+      method: "POST",
+      body: JSON.stringify({ data: b64, filename: file.name }),
+    });
     $("#edit-src").value = up.data_url || up.local_url;
   };
 
@@ -517,7 +780,9 @@ function renderVideo(item, data) {
     <label>模型<select id="vid-model">${modelOptions((m) => /video/i.test(m.capability + m.id))}</select></label>`;
   const modelSel = $("#vid-model");
   const preferred = data.model || "grok-imagine-video";
-  if (![...modelSel.options].some((o) => o.value === preferred)) modelSel.add(new Option(preferred, preferred, true, true));
+  if (![...modelSel.options].some((o) => o.value === preferred)) {
+    modelSel.add(new Option(preferred, preferred, true, true));
+  }
   modelSel.value = preferred;
 
   const content = $("#content");
@@ -526,9 +791,9 @@ function renderVideo(item, data) {
     <label>Prompt<textarea id="vid-prompt" rows="3">${escapeHtml(data.prompt || "")}</textarea></label>
     <label>参考图 URL（可选）<input id="vid-img" type="text" value="${escapeAttr(data.image_url || "")}" /></label>
     <div class="row">
-      <label>时长<select id="vid-dur">${[6,10,15].map((v)=>`<option value="${v}" ${Number(data.duration)===v?"selected":""}>${v}s</option>`).join("")}</select></label>
-      <label>比例<select id="vid-ar">${["1:1","16:9","9:16","4:3","3:4","3:2","2:3"].map((v)=>`<option ${data.aspect_ratio===v?"selected":""}>${v}</option>`).join("")}</select></label>
-      <label>分辨率<select id="vid-res">${["480p","720p","1080p"].map((v)=>`<option ${data.resolution===v?"selected":""}>${v}</option>`).join("")}</select></label>
+      <label>时长<select id="vid-dur">${[6, 10, 15].map((v) => `<option value="${v}" ${Number(data.duration) === v ? "selected" : ""}>${v}s</option>`).join("")}</select></label>
+      <label>比例<select id="vid-ar">${["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"].map((v) => `<option ${data.aspect_ratio === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+      <label>分辨率<select id="vid-res">${["480p", "720p", "1080p"].map((v) => `<option ${data.resolution === v ? "selected" : ""}>${v}</option>`).join("")}</select></label>
       <button id="vid-go">生成视频</button>
     </div>
     <div id="vid-status" class="status">${escapeHtml(data.status || "idle")} ${data.progress ? data.progress + "%" : ""}</div>
@@ -595,8 +860,7 @@ function paintImages(grid, images) {
     image.src = mediaUrl(img);
     image.alt = "generated";
     card.appendChild(image);
-    const cap = el("div", "cap", img.revised_prompt || img.url || img.local_path || "");
-    card.appendChild(cap);
+    card.appendChild(el("div", "cap", img.revised_prompt || img.url || img.local_path || ""));
     grid.appendChild(card);
   }
 }
@@ -633,7 +897,7 @@ async function createItem(kind) {
 }
 
 function bindUi() {
-  document.querySelectorAll("[data-new]").forEach((btn) => {
+  $$("[data-new]").forEach((btn) => {
     btn.onclick = () => createItem(btn.dataset.new);
   });
   $("#history-filter").oninput = (e) => {
@@ -673,16 +937,17 @@ function bindUi() {
       }),
     });
     await refreshConfig();
-    try { await refreshModels(); } catch {}
+    try { await refreshModels(); } catch { /* ignore */ }
     $("#settings-dialog").close();
   };
 }
 
 async function boot() {
+  setupMarkdown();
   bindUi();
   await refreshConfig();
   if (state.config.ready) {
-    try { await refreshModels(); } catch {}
+    try { await refreshModels(); } catch { /* ignore */ }
   } else {
     $("#settings-dialog").showModal();
   }

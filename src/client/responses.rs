@@ -27,7 +27,16 @@ pub struct StreamSnapshot {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatStreamEvent {
     Delta { snapshot: StreamSnapshot },
-    Done { snapshot: StreamSnapshot },
+    /// Emitted by the server after history is persisted (may include full message list).
+    Done {
+        snapshot: StreamSnapshot,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        messages: Option<Vec<ChatMessage>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        assistant_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+    },
     Error { message: String },
 }
 
@@ -49,8 +58,9 @@ pub async fn stream_chat(
         let text = resp.text().await?;
         let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let snap = snapshot_from_envelope(&payload);
+        // Final Done is emitted by the server after history is saved.
         let _ = tx
-            .send(ChatStreamEvent::Done {
+            .send(ChatStreamEvent::Delta {
                 snapshot: snap.clone(),
             })
             .await;
@@ -115,8 +125,9 @@ pub async fn stream_chat(
             "empty responses stream".into(),
         ));
     }
+    // Final Done is emitted by the server after history is persisted.
     let _ = tx
-        .send(ChatStreamEvent::Done {
+        .send(ChatStreamEvent::Delta {
             snapshot: snapshot.clone(),
         })
         .await;
