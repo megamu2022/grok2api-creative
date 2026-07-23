@@ -147,6 +147,38 @@ function toolStatus(t) {
   return t?.status || "completed";
 }
 
+function scrollChatToBottom({ force = false } = {}) {
+  const content = $("#content");
+  if (!content) return;
+  if (!force) {
+    const dist = content.scrollHeight - content.scrollTop - content.clientHeight;
+    if (dist > 120) return;
+  }
+  content.scrollTop = content.scrollHeight;
+}
+
+function toolCountSummary(tools) {
+  const counts = new Map();
+  for (const t of tools || []) {
+    const name = toolName(t);
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([name, n]) => (n > 1 ? `${name} ×${n}` : name))
+    .join(" · ");
+}
+
+function updateLocalMessage(historyId, messageId, patch) {
+  const item = state.items.find((x) => x.id === historyId);
+  if (!item) return;
+  const p = payloadOf(item);
+  if (p?.type !== "chat") return;
+  const msg = (p.data.messages || []).find((m) => m.id === messageId);
+  if (!msg) return;
+  Object.assign(msg, patch);
+  item.payload = { payload_type: "chat", data: p.data };
+}
+
 async function refreshConfig() {
   state.config = await api("/api/config");
   const banner = $("#setup-banner");
@@ -312,7 +344,7 @@ function renderChat(item, chat) {
     box.appendChild(renderMessage(item, msg));
   }
   $("#content").appendChild(box);
-  box.scrollTop = box.scrollHeight;
+  scrollChatToBottom({ force: true });
 
   const composer = $("#composer");
   composer.classList.remove("hidden");
@@ -332,22 +364,54 @@ function renderChat(item, chat) {
   $("#chat-send").onclick = () => sendChat(item);
 }
 
-function renderToolCards(tools) {
-  const wrap = el("div", "tools");
-  for (const t of tools || []) {
+function renderThinkingBlock(reasoning, { live = false } = {}) {
+  const text = reasoning || "";
+  if (!text && !live) return null;
+  const details = document.createElement("details");
+  details.className = "meta-block thinking-block";
+  details.open = false;
+  const summary = document.createElement("summary");
+  const label = el("span", "meta-label", "思考");
+  const count = el("span", "meta-count", text ? `${text.length} 字` : live ? "进行中…" : "");
+  summary.appendChild(label);
+  summary.appendChild(count);
+  details.appendChild(summary);
+  const body = el("div", "meta-body", text);
+  details.appendChild(body);
+  return details;
+}
+
+function renderToolCards(tools, { live = false } = {}) {
+  const list = tools || [];
+  if (!list.length && !live) return null;
+  const details = document.createElement("details");
+  details.className = "meta-block tools-block";
+  details.open = false;
+
+  const summary = document.createElement("summary");
+  const label = el("span", "meta-label", "工具");
+  const countText = list.length
+    ? `${list.length} 次 · ${toolCountSummary(list)}`
+    : live
+      ? "调用中…"
+      : "";
+  const count = el("span", "meta-count", countText);
+  summary.appendChild(label);
+  summary.appendChild(count);
+  details.appendChild(summary);
+
+  const wrap = el("div", "tools-list");
+  for (const t of list) {
     const card = el("div", "tool-card");
     const head = el("div", "tool-head");
-    const badge = el("span", `badge ${toolStatus(t)}`, toolStatus(t));
-    const name = el("span", "tool-name", toolName(t));
-    head.appendChild(badge);
-    head.appendChild(name);
+    head.appendChild(el("span", `badge ${toolStatus(t)}`, toolStatus(t)));
+    head.appendChild(el("span", "tool-name", toolName(t)));
     card.appendChild(head);
-    if (t.detail) {
-      card.appendChild(el("div", "tool-detail", t.detail));
-    }
+    if (t.detail) card.appendChild(el("div", "tool-detail", t.detail));
     wrap.appendChild(card);
   }
-  return wrap;
+  details.appendChild(wrap);
+  return details;
 }
 
 function renderMessage(item, msg, { live = false } = {}) {
@@ -355,78 +419,121 @@ function renderMessage(item, msg, { live = false } = {}) {
   const node = el("div", `msg ${role}${live ? " streaming" : ""}`);
   if (msg.id) node.dataset.id = msg.id;
   if (live) node.dataset.live = "1";
+  node.dataset.content = msg.content || "";
 
   const roleRow = el("div", "role-row");
-  roleRow.appendChild(el("div", "role", role === "user" ? "You" : role));
+  roleRow.appendChild(el("div", "role", role === "user" ? "You" : "Assistant"));
   if (live) roleRow.appendChild(el("div", "stream-dot"));
   node.appendChild(roleRow);
 
-  if (msg.reasoning) {
-    const details = document.createElement("details");
-    details.className = "reasoning";
-    details.open = live;
-    const summary = document.createElement("summary");
-    summary.textContent = "Thinking";
-    details.appendChild(summary);
-    const body = el("div", null, msg.reasoning);
-    details.appendChild(body);
-    node.appendChild(details);
-  }
+  const thinking = renderThinkingBlock(msg.reasoning || "", { live });
+  if (thinking) node.appendChild(thinking);
 
-  if (msg.tools?.length) {
-    node.appendChild(renderToolCards(msg.tools));
-  }
+  const tools = renderToolCards(msg.tools || [], { live });
+  if (tools) node.appendChild(tools);
 
   const body = el("div", "body");
   if (role === "assistant") setMarkdownBody(body, msg.content || "");
   else setMarkdownBody(body, msg.content || "", { plain: true });
   node.appendChild(body);
 
-  // inline edit area
   const editBox = el("div", "edit-box");
   const ta = document.createElement("textarea");
   ta.value = msg.content || "";
+  ta.rows = Math.min(16, Math.max(4, (msg.content || "").split("\n").length + 1));
   editBox.appendChild(ta);
   const editActions = el("div", "edit-actions");
   const saveBtn = el("button", null, "保存");
   const saveRetryBtn = el("button", null, "保存并重试");
   const cancelBtn = el("button", null, "取消");
+  const hint = el("span", "edit-hint", "Esc 取消 · ⌘/Ctrl+Enter 保存" + (role === "user" ? "并重试" : ""));
   editActions.appendChild(saveBtn);
   if (role === "user") editActions.appendChild(saveRetryBtn);
   editActions.appendChild(cancelBtn);
+  editActions.appendChild(hint);
   editBox.appendChild(editActions);
   node.appendChild(editBox);
+
+  const exitEdit = () => {
+    node.classList.remove("editing");
+    ta.value = node.dataset.content || msg.content || "";
+  };
+
+  const applyLocalContent = (next) => {
+    node.dataset.content = next;
+    msg.content = next;
+    if (role === "assistant") setMarkdownBody(body, next);
+    else setMarkdownBody(body, next, { plain: true });
+    updateLocalMessage(item.id, msg.id, { content: next });
+  };
+
+  const doSave = async (resend) => {
+    if (state.streaming) return;
+    const next = ta.value;
+    saveBtn.disabled = true;
+    saveRetryBtn.disabled = true;
+    try {
+      await api(`/api/chat/${item.id}/edit-message`, {
+        method: "POST",
+        body: JSON.stringify({ message_id: msg.id, content: next, resend }),
+      });
+      applyLocalContent(next);
+      node.classList.remove("editing");
+      if (resend) {
+        await streamRetry(item.id, msg.id);
+      } else {
+        await refreshHistory({ rerender: false });
+      }
+    } catch (e) {
+      alert(e.message || String(e));
+    } finally {
+      saveBtn.disabled = false;
+      saveRetryBtn.disabled = false;
+    }
+  };
+
+  cancelBtn.onclick = exitEdit;
+  saveBtn.onclick = () => doSave(false);
+  saveRetryBtn.onclick = () => doSave(true);
+  ta.onkeydown = (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      exitEdit();
+      return;
+    }
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      doSave(role === "user");
+    }
+  };
 
   if (!live && (role === "user" || role === "assistant") && msg.id) {
     const actions = el("div", "msg-actions");
     const editBtn = el("button", null, "编辑");
     editBtn.onclick = () => {
+      if (state.streaming) return;
       node.classList.add("editing");
-      ta.value = msg.content || "";
+      ta.value = node.dataset.content || msg.content || "";
       ta.focus();
-    };
-    cancelBtn.onclick = () => node.classList.remove("editing");
-    saveBtn.onclick = async () => {
-      const next = ta.value;
-      await api(`/api/chat/${item.id}/edit-message`, {
-        method: "POST",
-        body: JSON.stringify({ message_id: msg.id, content: next, resend: false }),
-      });
-      await refreshHistory();
-    };
-    saveRetryBtn.onclick = async () => {
-      const next = ta.value;
-      await api(`/api/chat/${item.id}/edit-message`, {
-        method: "POST",
-        body: JSON.stringify({ message_id: msg.id, content: next, resend: true }),
-      });
-      await refreshHistory({ rerender: true });
-      await streamRetry(item.id, msg.id);
+      ta.setSelectionRange(ta.value.length, ta.value.length);
     };
     actions.appendChild(editBtn);
 
+    const copyBtn = el("button", null, "复制");
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(node.dataset.content || msg.content || "");
+        copyBtn.textContent = "已复制";
+        setTimeout(() => { copyBtn.textContent = "复制"; }, 1000);
+      } catch {
+        /* ignore */
+      }
+    };
+    actions.appendChild(copyBtn);
+
     const delBtn = el("button", null, "删除");
     delBtn.onclick = async () => {
+      if (state.streaming) return;
       if (!confirm("删除该消息？")) return;
       await api(`/api/chat/${item.id}/delete-message`, {
         method: "POST",
@@ -438,7 +545,10 @@ function renderMessage(item, msg, { live = false } = {}) {
 
     if (role === "user") {
       const retryBtn = el("button", null, "重试");
-      retryBtn.onclick = () => streamRetry(item.id, msg.id);
+      retryBtn.onclick = () => {
+        if (state.streaming) return;
+        streamRetry(item.id, msg.id);
+      };
       actions.appendChild(retryBtn);
     }
     node.appendChild(actions);
@@ -449,33 +559,41 @@ function renderMessage(item, msg, { live = false } = {}) {
 
 function updateLiveAssistant(node, snap) {
   if (!node) return;
-  let reasoning = node.querySelector("details.reasoning");
+  const roleRow = node.querySelector(".role-row");
+
+  let thinking = node.querySelector(".thinking-block");
   if (snap.reasoning) {
-    if (!reasoning) {
-      reasoning = document.createElement("details");
-      reasoning.className = "reasoning";
-      reasoning.open = true;
-      reasoning.innerHTML = `<summary>Thinking</summary><div></div>`;
-      const roleRow = node.querySelector(".role-row");
-      roleRow.after(reasoning);
+    if (!thinking) {
+      thinking = renderThinkingBlock(snap.reasoning, { live: true });
+      if (thinking) {
+        const tools = node.querySelector(".tools-block");
+        const body = node.querySelector(".body");
+        if (tools) tools.before(thinking);
+        else if (body) body.before(thinking);
+        else roleRow.after(thinking);
+      }
+    } else {
+      thinking.querySelector(".meta-body").textContent = snap.reasoning;
+      const count = thinking.querySelector(".meta-count");
+      if (count) count.textContent = `${snap.reasoning.length} 字`;
     }
-    reasoning.querySelector("div").textContent = snap.reasoning;
   }
 
-  let tools = node.querySelector(".tools");
   if (snap.tools?.length) {
-    const next = renderToolCards(snap.tools);
-    if (tools) tools.replaceWith(next);
-    else {
+    const next = renderToolCards(snap.tools, { live: true });
+    const prev = node.querySelector(".tools-block");
+    if (prev && next) prev.replaceWith(next);
+    else if (next) {
       const body = node.querySelector(".body");
-      body.before(next);
+      if (body) body.before(next);
+      else node.appendChild(next);
     }
   }
 
   const body = node.querySelector(".body");
   setMarkdownBody(body, snap.text || "");
-  const box = node.parentElement;
-  if (box) box.scrollTop = box.scrollHeight;
+  node.dataset.content = snap.text || "";
+  scrollChatToBottom();
 }
 
 async function persistChatSettings(item) {
@@ -516,7 +634,7 @@ async function sendChat(item) {
   assistantNode.querySelector(".msg-actions")?.remove();
   assistantNode.querySelector(".edit-box")?.remove();
   box?.appendChild(assistantNode);
-  if (box) box.scrollTop = box.scrollHeight;
+  scrollChatToBottom({ force: true });
 
   state.streaming = true;
   $("#chat-status").textContent = "生成中…";
@@ -574,6 +692,7 @@ async function streamRetry(historyId, messageId) {
   assistantNode.querySelector(".msg-actions")?.remove();
   assistantNode.querySelector(".edit-box")?.remove();
   box?.appendChild(assistantNode);
+  scrollChatToBottom({ force: true });
 
   try {
     await consumeSse(

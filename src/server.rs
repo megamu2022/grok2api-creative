@@ -442,12 +442,9 @@ async fn edit_message(
         .position(|m| m.id == body.message_id)
         .ok_or_else(|| ApiError::not_found("message"))?;
     chat.messages[pos].content = body.content.clone();
-    // Truncate after this message
-    chat.messages.truncate(pos + 1);
-    // If assistant was edited, keep as is; if user and resend, will stream separately
-    if matches!(chat.messages[pos].role, Role::User) && body.resend {
-        // leave only up to user; caller should call stream with empty? 
-        // We mark by returning item; frontend calls stream with special flag
+    // Only truncate when resending (regenerate after this message).
+    if body.resend {
+        chat.messages.truncate(pos + 1);
     }
     item.touch();
     let out = item.clone();
